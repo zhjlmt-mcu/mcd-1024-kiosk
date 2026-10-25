@@ -1,0 +1,131 @@
+diff --git a/s31-image-viewer/main/CMakeLists.txt b/s31-image-viewer/main/CMakeLists.txt
+index ea26366..737de7c 100644
+--- a/s31-image-viewer/main/CMakeLists.txt
++++ b/s31-image-viewer/main/CMakeLists.txt
+@@ -6,6 +6,12 @@ idf_component_register(SRCS "main.c" "image_viewer.c" "images.c" "imgbin.c"
+                                 "console_cmds.c"
+                        INCLUDE_DIRS "."
+                        EMBED_FILES "../tools/ble_upload.html"
++                       "../../1024-kiosk/index.html"
++                       "../../1024-kiosk/css/style.css"
++                       "../../1024-kiosk/js/menu-data.js"
++                       "../../1024-kiosk/js/ai.js"
++                       "../../1024-kiosk/js/voice.js"
++                       "../../1024-kiosk/js/app.js"
+                        REQUIRES console driver
+                                 esp_board_manager esp_lvgl_adapter
+                                 esp_wifi esp_netif esp_event nvs_flash
+diff --git a/s31-image-viewer/main/http_xfer.c b/s31-image-viewer/main/http_xfer.c
+index 8fd380c..bc5b1c4 100644
+--- a/s31-image-viewer/main/http_xfer.c
++++ b/s31-image-viewer/main/http_xfer.c
+@@ -37,6 +37,59 @@ static httpd_handle_t s_server;
+ extern const uint8_t web_page_start[] asm("_binary_ble_upload_html_start");
+ extern const uint8_t web_page_end[]   asm("_binary_ble_upload_html_end");
+ 
++/* 1024-kiosk 点餐屏：构建时直接嵌入仓库 1024-kiosk/ 源文件（单一来源，
++ * 改页面后重编译即生效），伺服在 /kiosk 下 */
++extern const uint8_t kiosk_index_start[]     asm("_binary_index_html_start");
++extern const uint8_t kiosk_index_end[]       asm("_binary_index_html_end");
++extern const uint8_t kiosk_css_start[]       asm("_binary_style_css_start");
++extern const uint8_t kiosk_css_end[]         asm("_binary_style_css_end");
++extern const uint8_t kiosk_menudata_start[]  asm("_binary_menu_data_js_start");
++extern const uint8_t kiosk_menudata_end[]    asm("_binary_menu_data_js_end");
++extern const uint8_t kiosk_ai_start[]        asm("_binary_ai_js_start");
++extern const uint8_t kiosk_ai_end[]          asm("_binary_ai_js_end");
++extern const uint8_t kiosk_voice_start[]     asm("_binary_voice_js_start");
++extern const uint8_t kiosk_voice_end[]       asm("_binary_voice_js_end");
++extern const uint8_t kiosk_app_start[]       asm("_binary_app_js_start");
++extern const uint8_t kiosk_app_end[]         asm("_binary_app_js_end");
++
++typedef struct {
++    const char *uri;
++    const char *type;
++    const uint8_t *start;
++    const uint8_t *end;
++} kiosk_asset_t;
++
++static const kiosk_asset_t s_kiosk_assets[] = {
++    { "/kiosk",                 "text/html; charset=utf-8", kiosk_index_start, kiosk_index_end },
++    { "/kiosk/",                "text/html; charset=utf-8", kiosk_index_start, kiosk_index_end },
++    { "/kiosk/css/style.css",   "text/css",                 kiosk_css_start,   kiosk_css_end },
++    { "/kiosk/js/menu-data.js", "application/javascript",   kiosk_menudata_start, kiosk_menudata_end },
++    { "/kiosk/js/ai.js",        "application/javascript",   kiosk_ai_start,    kiosk_ai_end },
++    { "/kiosk/js/voice.js",     "application/javascript",   kiosk_voice_start, kiosk_voice_end },
++    { "/kiosk/js/app.js",       "application/javascript",   kiosk_app_start,   kiosk_app_end },
++};
++
++static esp_err_t handler_kiosk(httpd_req_t *req)
++{
++    /* 页面资源是相对路径，必须以 /kiosk/ 结尾为基准解析；无斜杠一律 302 */
++    if (strcmp(req->uri, "/kiosk") == 0) {
++        httpd_resp_set_hdr(req, "Location", "/kiosk/");
++        httpd_resp_set_status(req, "302 Found");
++        httpd_resp_sendstr(req, "");
++        return ESP_OK;
++    }
++    for (unsigned i = 0; i < sizeof(s_kiosk_assets) / sizeof(s_kiosk_assets[0]); i++) {
++        if (strcmp(req->uri, s_kiosk_assets[i].uri) == 0) {
++            httpd_resp_set_type(req, s_kiosk_assets[i].type);
++            return httpd_resp_send(req, (const char *)s_kiosk_assets[i].start,
++                                   s_kiosk_assets[i].end - s_kiosk_assets[i].start);
++        }
++    }
++    httpd_resp_set_status(req, "404 Not Found");
++    httpd_resp_sendstr(req, "kiosk asset not found");
++    return ESP_OK;
++}
++
+ static void cors(httpd_req_t *req)
+ {
+     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+@@ -495,6 +548,8 @@ void http_xfer_start(void)
+     cfg.task_priority = 5;
+     cfg.stack_size = 8192;
+     cfg.lru_purge_enable = true;
++    /* 默认 8 个槽位不够：9 个业务端点 + 7 个 /kiosk 静态资源 */
++    cfg.max_uri_handlers = 20;
+ 
+     if (httpd_start(&s_server, &cfg) != ESP_OK) {
+         ESP_LOGE(TAG, "httpd start failed");
+@@ -512,6 +567,13 @@ void http_xfer_start(void)
+         { .uri = "/gif",     .method = HTTP_POST, .handler = handler_gif,    .user_ctx = NULL },
+         { .uri = "/sfx",     .method = HTTP_POST, .handler = handler_sfx,    .user_ctx = NULL },
+         { .uri = "/preview", .method = HTTP_POST, .handler = handler_preview, .user_ctx = NULL },
++        { .uri = "/kiosk",                 .method = HTTP_GET, .handler = handler_kiosk, .user_ctx = NULL },
++        { .uri = "/kiosk/",                .method = HTTP_GET, .handler = handler_kiosk, .user_ctx = NULL },
++        { .uri = "/kiosk/css/style.css",   .method = HTTP_GET, .handler = handler_kiosk, .user_ctx = NULL },
++        { .uri = "/kiosk/js/menu-data.js", .method = HTTP_GET, .handler = handler_kiosk, .user_ctx = NULL },
++        { .uri = "/kiosk/js/ai.js",        .method = HTTP_GET, .handler = handler_kiosk, .user_ctx = NULL },
++        { .uri = "/kiosk/js/voice.js",     .method = HTTP_GET, .handler = handler_kiosk, .user_ctx = NULL },
++        { .uri = "/kiosk/js/app.js",       .method = HTTP_GET, .handler = handler_kiosk, .user_ctx = NULL },
+     };
+     for (unsigned i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+         esp_err_t err = httpd_register_uri_handler(s_server, &uris[i]);
+diff --git a/s31-image-viewer/tools/ble_upload.html b/s31-image-viewer/tools/ble_upload.html
+index d461bcc..67b9736 100644
+--- a/s31-image-viewer/tools/ble_upload.html
++++ b/s31-image-viewer/tools/ble_upload.html
+@@ -171,6 +171,14 @@
+ 
+   footer { color: #61727d; font-size: 12px; text-align: center; margin-top: 22px; line-height: 1.9; }
+   footer code { color: var(--muted); }
++
++  .kiosk-link {
++    display: inline-flex; align-items: center; gap: 6px; margin-top: 9px;
++    padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: 700;
++    color: #ffd39a; background: rgba(255, 180, 84, .10);
++    border: 1px solid #5c4526; text-decoration: none; transition: .18s;
++  }
++  .kiosk-link:hover { background: rgba(255, 180, 84, .22); color: #ffe6bd; }
+   .toast {
+     position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 20px);
+     background: #1d2e39; border: 1px solid var(--line); color: var(--text);
+@@ -186,6 +194,7 @@
+     <div>
+       <h1>S31 <span>无线传图</span></h1>
+       <p class="sub">Web Bluetooth → /flash · 照片自动转 RGB565 · 上传后立即上屏，GIF 立即播放，掉电不丢</p>
++      <a class="kiosk-link" href="/kiosk">🍔 1024 智能点餐屏 · AI 店长帮你点</a>
+     </div>
+     <div class="pill"><span class="dot" id="linkDot"></span><span id="linkText">未连接</span></div>
+   </header>
